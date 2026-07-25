@@ -1,2 +1,0 @@
-# travel-planner
-travel planner
