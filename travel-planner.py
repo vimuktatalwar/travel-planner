@@ -3,11 +3,14 @@ from typing import List, Dict, Any
 import os
 from dotenv import load_dotenv
 from groq import Groq
+from openai import OpenAI
 
 # Configure the client (loads GROQ_API_KEY from .env)
 load_dotenv()
-client = Groq(api_key=os.environ["GROQ_API_KEY"])
-
+client_groq = Groq(api_key=os.environ["GROQ_API_KEY"])
+client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"]
+)
 
 PLANNER_SYSTEM_PROMPT = """
 You are a travel planning task-decomposition agent.
@@ -22,27 +25,19 @@ Every task MUST contain exactly these fields:
   "task": string,
   "category": string,
   "city": string or null,
-  "status": "pending",
   "depends_on": array of integer task IDs
 }
 
 Use sequential task IDs beginning with 1.
 
 Allowed categories:
-- research
-- itinerary
 - attraction
 - transportation
-- budget
 - lodging
-- food
-- validation
 
-Capture every city, duration, attraction requirement, transportation need,
-and budget constraint.
 
-Do not create the final itinerary.
-
+Capture every city, duration, attraction requirement, and transportation need.
+Do not book hotels, flights, or tickets. 
 Return only the valid JSON array. Do not include Markdown, explanations,
 or code fences.
 """
@@ -57,7 +52,7 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
 
     Returns:
         str: The response content from the model.
-    """
+    
     response = client.chat.completions.create(
         model='llama-3.3-70b-versatile',
         messages=[
@@ -69,7 +64,25 @@ def call_llm(system_prompt: str, user_prompt: str) -> str:
         n=1,
     )
     completion_text = response.choices[0].message.content
-    return completion_text
+    """
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            instructions=system_prompt,
+            input=user_prompt,
+            max_output_tokens=1500,
+        )
+    except Exception as exc:
+            raise RuntimeError(
+            f"OpenAI API request failed: {exc}"
+            ) from exc
+
+    completion_text = response.output_text
+
+    if not completion_text or not completion_text.strip():
+        raise RuntimeError("OpenAI returned an empty response.")
+
+    return completion_text.strip()
 
 def generate_travel_tasks(user_request: str) -> List[Dict[str, Any]]:
     if not user_request.strip():
@@ -88,15 +101,10 @@ def generate_travel_tasks(user_request: str) -> List[Dict[str, Any]]:
         raise ValueError("Task list is empty or not a list.")
 
     allowed_categories = {
-        "research",
-        "itinerary",
         "attraction",
         "transportation",
-        "budget",
         "lodging",
-        "food",
-        "validation",
-    }
+     }
 
     normalized_tasks = []
     used_task_ids = set()
@@ -128,7 +136,6 @@ def generate_travel_tasks(user_request: str) -> List[Dict[str, Any]]:
 
         # Add defaults for optional fields.
         task.setdefault("city", None)
-        task.setdefault("status", "pending")
         task.setdefault("depends_on", [])
 
         # Validate required content.
@@ -161,58 +168,192 @@ def generate_travel_tasks(user_request: str) -> List[Dict[str, Any]]:
 
 def execute_task(task: dict) -> str:
     """
-    Simulate execution of a single travel planning task by sending it to an LLM executor prompt.
-    This mock function is a placeholder for actual LLM interaction.
+    Execute one travel-planning task using the Groq-hosted Llama model.
 
     Args:
-        task (dict): A single task dictionary.
+        task: A travel-planning task containing fields such as
+            task_id, task, category, city, and depends_on.
 
     Returns:
-        str: Simulated execution result or response.
-    """
-    # Build a specialized prompt based on task details (mocked)
-    system_prompt = (
-        "You are a travel planning task executor. Execute the given small actionable task. "
-        "Provide the best answer or data required without creating the full itinerary."
-    )
-    user_prompt = f"Execute this task: {task['task']}"
+        The LLM-generated result for the task.
 
-    # Mocked response simulating the execution result
-    return f"Executed: {task['task']}"
+    Raises:
+        ValueError: If the task is invalid or the LLM returns no content.
+        RuntimeError: If the Groq API request fails.
+    """
+    if not isinstance(task, dict):
+        raise ValueError("Task must be a dictionary.")
+
+    task_description = task.get("task")
+
+    if not isinstance(task_description, str) or not task_description.strip():
+        raise ValueError("Task must contain a non-empty 'task' field.")
+
+    system_prompt = """
+You are a travel-planning task execution agent.
+
+Execute one small travel-planning task at a time.
+
+Rules:
+1. Answer only the specific task provided.
+2. Do not create the complete trip itinerary.
+3. Give practical and concise results.
+4. Include estimated prices when the task requests budgeting.
+5. Clearly label prices, schedules, and travel times as estimates when they
+   have not been verified with live data.
+6. Do not claim that reservations or tickets are available unless live
+   availability has been provided.
+7. When the task concerns an attraction, provide its name, city, why it
+   satisfies the requirement, and useful planning notes.
+8. When the task concerns transportation, provide the route, transportation
+   type, approximate duration, and estimated cost.
+9. When the task concerns budgeting, show the calculation clearly.
+10. If the task cannot be completed with the available information, explain
+    exactly what additional information is needed.
+
+Return plain text without Markdown code fences.
+""".strip()
+
+    task_payload = {
+        "task_id": task.get("task_id"),
+        "task": task_description,
+        "category": task.get("category"),
+        "city": task.get("city"),
+        "depends_on": task.get("depends_on", []),
+    }
+
+    user_prompt = (
+        "Execute the following travel-planning task:\n\n"
+        f"{json.dumps(task_payload, indent=2, ensure_ascii=False)}"
+    )
+
+    try:
+        result = call_llm(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM execution failed for task {task.get('task_id')}: {exc}"
+        ) from exc
+
+    if not result or not result.strip():
+        raise ValueError(
+            f"The LLM returned an empty result for task {task.get('task_id')}."
+        )
+
+    return result.strip()
 
 
 def check_task_execution(task: dict) -> bool:
     """
-    Simulate verifying if task execution succeeded by sending its result to an LLM checker prompt.
-    This mock function determines success or failure based on keywords in the result string.
+    Use the Llama model to determine whether a travel task was
+    completed successfully.
 
     Args:
-        task (dict): A single task dictionary, expected to contain a 'result' field.
+        task: A task dictionary containing the original task and
+            its execution result.
 
     Returns:
-        bool: True if execution succeeded, False otherwise.
+        True when the checker determines that the task succeeded.
+        False when the task failed, is incomplete, or cannot be verified.
+
+    Raises:
+        ValueError: If the task or result is invalid.
+        RuntimeError: If the LLM checker request fails or returns invalid JSON.
     """
-    failure_indicators = [
-        "no tickets available",
-        "failed",
-        "error",
-        "not found",
-        "unavailable",
-        "unable to",
-        "cannot",
-    ]
+    if not isinstance(task, dict):
+        raise ValueError("Task must be a dictionary.")
 
-    # Extract result text and normalize it
-    result_text = task.get('result', '').lower()
+    task_description = task.get("task")
+    result = task.get("result")
 
-    # If any failure indicator appears in the result, flag as failure
-    for indicator in failure_indicators:
-        if indicator in result_text:
-            return False
+    if not isinstance(task_description, str) or not task_description.strip():
+        raise ValueError("Task must contain a non-empty 'task' field.")
 
-    # Otherwise, consider success
-    return True
+    if not isinstance(result, str) or not result.strip():
+        return False
 
+    system_prompt = """
+You are a quality-control checker for a travel-planning agent.
+
+Determine whether the execution result successfully completes the original
+travel-planning task.
+
+A task is successful only when:
+
+1. The result directly addresses the requested task.
+2. The result contains enough useful information to complete the task.
+3. The result does not report an error, failure, unavailable information,
+   or inability to complete the task.
+4. The result does not merely repeat the task.
+5. Required information such as a location, route, cost estimate, attraction,
+   duration, or calculation is present when requested.
+6. Estimates are clearly identified as estimates when live information was
+   not verified.
+7. The result does not claim live availability, exact pricing, or confirmed
+   reservations without supporting data.
+
+Return only valid JSON using exactly this format:
+
+{
+  "success": true,
+  "reason": "Brief explanation"
+}
+
+Do not include Markdown, code fences, or additional text.
+""".strip()
+
+    checker_payload = {
+        "task_id": task.get("task_id"),
+        "task": task_description,
+        "category": task.get("category"),
+        "city": task.get("city"),
+        "result": result,
+    }
+
+    user_prompt = (
+        "Evaluate whether this travel-planning task was completed successfully:\n\n"
+        f"{json.dumps(checker_payload, indent=2, ensure_ascii=False)}"
+    )
+
+    try:
+        checker_response = call_llm(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            f"LLM checker failed for task {task.get('task_id')}: {exc}"
+        ) from exc
+
+    if not checker_response or not checker_response.strip():
+        raise RuntimeError(
+            f"LLM checker returned an empty response for task "
+            f"{task.get('task_id')}."
+        )
+
+    try:
+        checker_data = json.loads(checker_response)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"LLM checker returned invalid JSON:\n{checker_response}"
+        ) from exc
+
+    success = checker_data.get("success")
+
+    if not isinstance(success, bool):
+        raise RuntimeError(
+            "LLM checker response must contain a Boolean 'success' field."
+        )
+
+    # Store the checker explanation for debugging and later replanning.
+    task["check_reason"] = checker_data.get(
+        "reason",
+        "No checker explanation was provided.",
+    )
+
+    return success
 
 def replan_tasks_on_failure(tasks: list[dict], failed_task: dict) -> list[dict]:
     """
@@ -231,7 +372,6 @@ def replan_tasks_on_failure(tasks: list[dict], failed_task: dict) -> list[dict]:
         "task": f"Replan remaining tasks due to failure in task '{failed_task['task']}'",
         "category": "validation",
         "city": None,
-        "status": "pending",
         "depends_on": [],
     }
     # Append replanning notice task at the end
@@ -263,13 +403,23 @@ def execute_and_check_tasks(tasks: list[dict]) -> list[dict]:
         executed_tasks.append(task_with_result)
 
         # Check if execution succeeded
-        if not check_task_execution(task_with_result):
-            # If failed, replan remaining tasks dynamically
-            remaining_tasks = tasks[tasks.index(task)+1:]
-            replanned = replan_tasks_on_failure(remaining_tasks, task_with_result)
-            # Append replanned tasks (excluding original remaining to avoid duplication)
+        task_succeeded = False
+        try:
+            task_succeeded = check_task_execution(task_with_result)
+        except Exception as exc:
+            task_succeeded = False
+            task_with_result["check_reason"] = (
+                f"Checker could not evaluate the task: {exc}"
+        )
+
+        if not task_succeeded:
+            remaining_tasks = tasks[tasks.index(task) + 1:]
+            replanned = replan_tasks_on_failure(
+            remaining_tasks,
+            task_with_result        )
             executed_tasks.extend(replanned)
-            break  # Stop executing further original tasks after failure
+            break
+      
 
     return executed_tasks
 
@@ -277,12 +427,24 @@ def execute_and_check_tasks(tasks: list[dict]) -> list[dict]:
 # Demonstration using the example user request.
 if __name__ == "__main__":
     user_request = (
-        "I want to go to Dallas for 2 days, L.A for 2, and Orlando for 4, "
-        "but I need to make sure I see a theme park in each and budget my flight tickets."
+        "I want to plan itinerary to go from my home in Boston to Dallas for 2 days, L.A for 2, and Orlando for 2, "
+        "but I need to make sure I see most popular theme park in each city,"
+        "Keep one day for theme park and one day for other attarctions in each city. Advice other attracions in each city,"
+         "and Travel dates are from September 1 to September 6, 2 people will be traveling, and I want to stay in 3-star hotels and fly economy class." 
     )
     try:
         tasks = generate_travel_tasks(user_request)
         final_tasks = execute_and_check_tasks(tasks)
-        print(json.dumps(final_tasks, indent=4))
+       # print(json.dumps(final_tasks, indent=4))
+
+        prompt1 = f"Summarize the itinerary in tabular format, include date, city, task, category, attraction names from result: {final_tasks}"
+
+        response1 = client_groq.chat.completions.create(
+            model='llama-3.3-70b-versatile',
+            messages=[{"role": "user", "content": prompt1}]
+        )
+        summary = response1.choices[0].message.content.strip()
+        print(f"Summary: {summary}")
+
     except ValueError as err:
         print(f"Error: {err}")
